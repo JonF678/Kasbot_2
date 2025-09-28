@@ -1220,7 +1220,7 @@
     },
     {
       "parameters": {
-        "jsCode": "/**\n * Build Menu Reply — Category-first UX\n * - Default view: list categories (with item counts)\n * - Category view: list items in the chosen category + pagination\n * - Respects your existing Parse Callback shape and button styles\n */\n\nconst PAGE_SIZE = 6;\nconst CURRENCY = '₵';\nconst HEADER_CATS = '🍽️ *Browse by Category*';\nconst HEADER_ITEMS = '🍽️ *Today’s Menu*';\nconst MAX_LABEL_CHARS = 40;\n\nconst clean = v => (v ?? '').toString().trim();\nconst isTrue = v => {\n  const s = clean(v).toLowerCase();\n  return s === 'true' || s === '1' || v === true || v === 1;\n};\nconst priceFmt = v => {\n  const n = parseFloat(v);\n  return Number.isFinite(n) ? `${CURRENCY}${n.toFixed(2)}` : `${v}`;\n};\nconst trimLabel = (s, n = MAX_LABEL_CHARS) => {\n  const t = clean(s);\n  return t.length > n ? t.slice(0, n - 1) + '…' : t;\n};\n\n// Encode category safely for callback (avoid '|')\nconst enc = s => clean(s).replace(/\\|/g, '/');\nconst dec = s => clean(s); // we only replaced '|' so direct clean is fine\n\n// --- SAFE helper to fetch from a named node if it ran ---\nfunction fromNode(name) {\n  try {\n    const a = $items(name);\n    if (Array.isArray(a) && a.length) return a[0].json;\n  } catch (_) {}\n  return undefined;\n}\n\n// Prefer Parse Callback (always runs), else Default Menu Page, else current $json\nconst ctx = fromNode('Parse Callback') || fromNode('Default Menu Page') || $json;\n\nconst chat_id =\n  ctx?.chat_id ??\n  ctx?.message?.chat?.id ??\n  ctx?.callback_query?.message?.chat?.id;\n\nif (!chat_id) throw new Error('Build Menu Reply: no chat_id found.');\n\n// ---- Read menu rows from input ----\nconst rows = $input.all().map(i => i.json);\n\n// Filter available\nconst available = rows.filter(r => {\n  if ('Active' in r) return isTrue(r.Active);\n  if ('Available' in r) return isTrue(r.Available);\n  return true;\n});\n\n// Dedupe by SKU\nconst seen = new Set();\nconst unique = [];\nfor (const r of available) {\n  const key = clean(r.SKU) || `${clean(r.Dish)}|${clean(r.Price)}`;\n  if (!seen.has(key)) { seen.add(key); unique.push(r); }\n}\n\n// Group by Category + counts\nconst groups = {};\nfor (const r of unique) {\n  const cat = clean(r.Category) || 'Menu';\n  (groups[cat] ||= []).push(r);\n}\nObject.values(groups).forEach(list =>\n  list.sort((a, b) => clean(a.Dish).localeCompare(clean(b.Dish)))\n);\nconst catNames = Object.keys(groups).sort((a, b) => a.localeCompare(b));\nconst counts = Object.fromEntries(catNames.map(c => [c, groups[c].length]));\n\n// ---- Work out mode from ctx (categories index vs. specific category) ----\nconst kind   = clean(ctx.kind);\nconst action = clean(ctx.action);\nconst data   = clean(ctx.data);\nlet token    = clean(ctx.sku); // will carry category or category::page\nlet page     = 1;\nlet catSel   = '';\n\nif (data === 'MENU|CATS') {\n  // Force categories index\n} else if (kind === 'CAT' && action === 'OPEN') {\n  catSel = dec(token);\n  page = 1;\n} else if (kind === 'CAT' && action === 'PAGE') {\n  const [rawCat, p] = token.split('::');\n  catSel = dec(rawCat);\n  page = Math.max(1, Number(p || 1));\n} else {\n  // When invoked from /menu, MENU|OPEN, or MENU|REFRESH, default to category index\n}\n\n// ---- Render Categories index (default) ----\nif (!catSel) {\n  if (!catNames.length) {\n    return [{\n      json: {\n        chat_id,\n        text: `${HEADER_CATS}\\n\\n_No dishes available right now. Please check back later._`,\n        parse_mode: 'Markdown',\n        reply_markup: {\n          inline_keyboard: [\n            [{ text: '🔄 Refresh', callback_data: 'MENU|REFRESH' }],\n            [\n              { text: '🧺 View Cart',  callback_data: 'CART|VIEW' },\n              { text: '✅ Checkout',   callback_data: 'CART|CHECKOUT' },\n              { text: '🧹 Clear',      callback_data: 'CART|CLEAR' }\n            ]\n          ]\n        }\n      }\n    }];\n  }\n\n  // Body text (nice to see counts)\n  let text = `${HEADER_CATS}\\n\\n_Select a category:_\\n`;\n  for (const c of catNames) {\n    text += `• ${c} (${counts[c]})\\n`;\n  }\n\n  // Keyboard (one button per category)\n  const kb = [];\n  for (const c of catNames) {\n    kb.push([{ text: `${c} (${counts[c]})`, callback_data: `CAT|OPEN|${enc(c)}` }]);\n  }\n  // Utilities\n  kb.push([\n    { text: '🧺 View Cart',  callback_data: 'CART|VIEW' },\n    { text: '✅ Checkout',   callback_data: 'CART|CHECKOUT' },\n    { text: '🧹 Clear',      callback_data: 'CART|CLEAR' }\n  ]);\n\n  return [{ json: { chat_id, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } } }];\n}\n\n// ---- Render Items for selected category ----\nconst inCat = (groups[catSel] || []).map(r => {\n  const base = `${clean(r.Emoji) ? clean(r.Emoji) + ' ' : ''}${clean(r.Dish) || clean(r.ButtonLabel) || clean(r.SKU)}`;\n  return {\n    sku: clean(r.SKU) || `${clean(r.Dish)}|${clean(r.Price)}`,\n    itemBtn: `${trimLabel(base)} — ${priceFmt(r.Price)}`,\n    bodyLine: `• ${base} — ${priceFmt(r.Price)}`\n  };\n});\n\nif (!inCat.length) {\n  // Category name typo or empty category\n  return [{\n    json: {\n      chat_id,\n      text: `*${HEADER_ITEMS}*\\n\\n_No dishes in \"${catSel}\" right now._`,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: '🔙 Categories', callback_data: 'MENU|CATS' }],\n          [\n            { text: '🧺 View Cart',  callback_data: 'CART|VIEW' },\n            { text: '✅ Checkout',   callback_data: 'CART|CHECKOUT' },\n            { text: '🧹 Clear',      callback_data: 'CART|CLEAR' }\n          ]\n        ]\n      }\n    }\n  }];\n}\n\n// Pagination\nconst totalItems = inCat.length;\nconst totalPages = Math.max(1, Math.ceil(totalItems / PAGE_SIZE));\npage = Math.min(Math.max(1, page), totalPages);\nconst start = (page - 1) * PAGE_SIZE;\nconst pageItems = inCat.slice(start, start + PAGE_SIZE);\n\n// Message body\nlet text = `${HEADER_ITEMS}\\n\\n*${catSel}*\\n`;\nfor (const it of pageItems) text += it.bodyLine + '\\n';\ntext += `\\n_Page ${page} of ${totalPages}_\\n_Tap an item to add to cart_`;\n\n// Keyboard: item buttons with ℹ️ rows\nconst kb = [];\nfor (const it of pageItems) {\n  kb.push([{ text: it.itemBtn, callback_data: `ADD|${it.sku}` }]);\n  kb.push([{ text: 'ℹ️',       callback_data: `DETAILS|${it.sku}` }]);\n}\n\n// Nav inside category\nconst nav = [];\nif (page > 1)        nav.push({ text: '⬅️ Prev', callback_data: `CAT|PAGE|${enc(catSel)}::${page - 1}` });\nnav.push({ text: '🔙 Categories', callback_data: 'MENU|CATS' });\nif (page < totalPages) nav.push({ text: 'Next ➡️', callback_data: `CAT|PAGE|${enc(catSel)}::${page + 1}` });\nkb.push(nav);\n\n// Utilities\nkb.push([\n  { text: '🧺 View Cart',  callback_data: 'CART|VIEW' },\n  { text: '✅ Checkout',   callback_data: 'CART|CHECKOUT' },\n  { text: '🧹 Clear',      callback_data: 'CART|CLEAR' }\n]);\n\nreturn [{ json: { chat_id, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } } }];\n"
+        "jsCode": "/**\n * Build Menu Reply — Category-first UX\n * - Default view: list categories (with item counts)\n * - Category view: list items in the chosen category + pagination\n * - Respects your existing Parse Callback shape and button styles\n */\n\nconst PAGE_SIZE = 6;\nconst CURRENCY = '₵';\nconst HEADER_CATS = '🍽️ *Browse by Category*';\nconst HEADER_ITEMS = '🍽️ *Today’s Menu*';\nconst MAX_LABEL_CHARS = 40;\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\n\nconst clean = v => (v ?? '').toString().trim();\nconst isTrue = v => {\n  const s = clean(v).toLowerCase();\n  return s === 'true' || s === '1' || v === true || v === 1;\n};\nconst priceFmt = v => {\n  const n = parseFloat(v);\n  return Number.isFinite(n) ? `${{CURRENCY}}${{n.toFixed(2)}}` : `${{v}}`;\n};\nconst trimLabel = (s, n = MAX_LABEL_CHARS) => {\n  const t = clean(s);\n  return t.length > n ? t.slice(0, n - 1) + '…' : t;\n};\n\nconst enc = s => clean(s).replace(/\\|/g, '/');\nconst dec = s => clean(s);\n\nfunction fromNode(name) {\n  try {\n    const a = $items(name);\n    if (Array.isArray(a) && a.length) return a[0].json;\n  } catch (_) {}\n  return undefined;\n}\n\nconst ctx = fromNode('Parse Callback') || fromNode('Default Menu Page') || $json;\n\nconst chat_id =\n  ctx?.chat_id ??\n  ctx?.message?.chat?.id ??\n  ctx?.callback_query?.message?.chat?.id;\n\nif (!chat_id) throw new Error('Build Menu Reply: no chat_id found.');\n\nconst rows = $input.all().map(i => i.json);\n\nconst available = rows.filter(r => {\n  if ('Active' in r) return isTrue(r.Active);\n  if ('Available' in r) return isTrue(r.Available);\n  return true;\n});\n\nconst seen = new Set();\nconst unique = [];\nfor (const r of available) {\n  const key = clean(r.SKU) || `${{clean(r.Dish)}}|${{clean(r.Price)}}`;\n  if (!seen.has(key)) { seen.add(key); unique.push(r); }\n}\n\nconst groups = {};\nfor (const r of unique) {\n  const cat = clean(r.Category) || 'Menu';\n  (groups[cat] ||= []).push(r);\n}\nObject.values(groups).forEach(list =>\n  list.sort((a, b) => clean(a.Dish).localeCompare(clean(b.Dish)))\n);\nconst catNames = Object.keys(groups).sort((a, b) => a.localeCompare(b));\nconst counts = Object.fromEntries(catNames.map(c => [c, groups[c].length]));\n\nconst kind   = clean(ctx.kind);\nconst action = clean(ctx.action);\nconst data   = clean(ctx.data);\nlet token    = clean(ctx.sku);\nlet page     = 1;\nlet catSel   = '';\n\nif (data === 'MENU|CATS') {\n} else if (kind === 'CAT' && action === 'OPEN') {\n  catSel = dec(token);\n  page = 1;\n} else if (kind === 'CAT' && action === 'PAGE') {\n  const [rawCat, p] = token.split('::');\n  catSel = dec(rawCat);\n  page = Math.max(1, Number(p || 1));\n}\n\nif (!catSel) {\n  if (!catNames.length) {\n    return [{\n      json: {\n        chat_id,\n        text: `${{HEADER_CATS}}\n\n_No dishes available right now. Please check back later._`,\n        parse_mode: 'Markdown',\n        reply_markup: {\n          inline_keyboard: [\n            [{ text: '🔄 Refresh', callback_data: 'MENU|REFRESH' }],\n            [\n              { text: '🧺 View Cart',  callback_data: 'CART|VIEW' },\n              { text: '✅ Checkout',   callback_data: 'CART|CHECKOUT' },\n              { text: '🧹 Clear',      callback_data: 'CART|CLEAR' }\n            ]\n          ]\n        }\n      }\n    }];\n  }\n\n  let text = `${{HEADER_CATS}}\n\n_Select a category:_\n`;\n  for (const c of catNames) {\n    text += `• ${{md(c)}} (${{counts[c]}})\n`;\n  }\n\n  const kb = [];\n  for (const c of catNames) {\n    kb.push([{ text: `${{c}} (${{counts[c]}})`, callback_data: `CAT|OPEN|${{enc(c)}}` }]);\n  }\n  kb.push([\n    { text: '🧺 View Cart',  callback_data: 'CART|VIEW' },\n    { text: '✅ Checkout',   callback_data: 'CART|CHECKOUT' },\n    { text: '🧹 Clear',      callback_data: 'CART|CLEAR' }\n  ]);\n\n  return [{ json: { chat_id, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } } }];\n}\n\nconst inCat = (groups[catSel] || []).map(r => {\n  const emoji = clean(r.Emoji);\n  const dishName = clean(r.Dish) || clean(r.ButtonLabel) || clean(r.SKU);\n  const baseRaw = [emoji, dishName].filter(Boolean).join(' ').trim();\n  return {\n    sku: clean(r.SKU) || `${{clean(r.Dish)}}|${{clean(r.Price)}}`,\n    itemBtn: `${{trimLabel(baseRaw)}} — ${{priceFmt(r.Price)}}`,\n    bodyLine: `• ${{md(baseRaw)}} — ${{priceFmt(r.Price)}}`\n  };\n});\n\nif (!inCat.length) {\n  return [{\n    json: {\n      chat_id,\n      text: `*${{HEADER_ITEMS}}*\n\n_No dishes in \"${{md(catSel)}}\" right now._`,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: '🔙 Categories', callback_data: 'MENU|CATS' }],\n          [\n            { text: '🧺 View Cart',  callback_data: 'CART|VIEW' },\n            { text: '✅ Checkout',   callback_data: 'CART|CHECKOUT' },\n            { text: '🧹 Clear',      callback_data: 'CART|CLEAR' }\n          ]\n        ]\n      }\n    }\n  }];\n}\n\nconst totalItems = inCat.length;\nconst totalPages = Math.max(1, Math.ceil(totalItems / PAGE_SIZE));\npage = Math.min(Math.max(1, page), totalPages);\nconst start = (page - 1) * PAGE_SIZE;\nconst pageItems = inCat.slice(start, start + PAGE_SIZE);\n\nlet text = `${{HEADER_ITEMS}}\n\n*${{md(catSel)}}*\n`;\nfor (const it of pageItems) text += it.bodyLine + '\n';\ntext += `\n_Page ${{page}} of ${{totalPages}}_\n_Tap an item to add to cart_`;\n\nconst kb = [];\nfor (const it of pageItems) {\n  kb.push([{ text: it.itemBtn, callback_data: `ADD|${{it.sku}}` }]);\n  kb.push([{ text: 'ℹ️',       callback_data: `DETAILS|${{it.sku}}` }]);\n}\n\nconst nav = [];\nif (page > 1)        nav.push({ text: '⬅️ Prev', callback_data: `CAT|PAGE|${{enc(catSel)}}::${{page - 1}}` });\nnav.push({ text: '🔙 Categories', callback_data: 'MENU|CATS' });\nif (page < totalPages) nav.push({ text: 'Next ➡️', callback_data: `CAT|PAGE|${{enc(catSel)}}::${{page + 1}}` });\nkb.push(nav);\n\nkb.push([\n  { text: '🧺 View Cart',  callback_data: 'CART|VIEW' },\n  { text: '✅ Checkout',   callback_data: 'CART|CHECKOUT' },\n  { text: '🧹 Clear',      callback_data: 'CART|CLEAR' }\n]);\n\nreturn [{ json: { chat_id, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } } }];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -1246,7 +1246,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Build Dish Details — sendPhoto (preferred) or sendMessage (fallback)\nconst CURRENCY = '₵';\n\n// Pull sku/chat_id from Parse Callback (fallback to current)\nconst parse = $items('Parse Callback')[0]?.json || $json;\nconst sku = parse.sku || $json.sku;\nconst chat_id = parse.chat_id || $json.chat_id;\n\n// Rows from GS: Read Menu(details) right before this node\nconst rows = $input.all().map(i => i.json);\nconst row = rows.find(r => String(r.SKU) === String(sku));\n\nif (!row) {\n  return [{\n    json: {\n      __endpoint: 'sendMessage',\n      payload: { chat_id, text: 'Item not found.' }\n    }\n  }];\n}\n\n// minimal Markdown escape for Telegram legacy Markdown\nconst esc = s => (s ?? '').toString().replace(/([_*[\\]()~`>#+\\-=|{}.!\\\\])/g, '\\\\$1');\n\nconst price = Number(row.Price) || 0;\nconst dish = `${esc(row.Emoji || '')} ${esc(row.Dish)} — ${CURRENCY}${price}`;\nconst notes = row.Notes ? `\\n_${esc(row.Notes)}_` : '';\n\nconst caption = `*${dish}*${notes}`;\n\n// Inline keyboard: Add + Back\nconst kb = {\n  inline_keyboard: [\n    [{ text: `➕ Add ${esc(row.Dish)}`, callback_data: `ADD|${sku}` }],\n    [{ text: '⬅️ Back', callback_data: 'MENU|REFRESH' }]\n  ]\n};\n\nif (row.PhotoURL) {\n  return [{\n    json: {\n      __endpoint: 'sendPhoto',\n      payload: {\n        chat_id,\n        photo: row.PhotoURL,\n        caption,\n        parse_mode: 'Markdown',\n        reply_markup: kb\n      }\n    }\n  }];\n}\n\n// Fallback without photo\nreturn [{\n  json: {\n    __endpoint: 'sendMessage',\n    payload: {\n      chat_id,\n      text: caption,\n      parse_mode: 'Markdown',\n      reply_markup: kb\n    }\n  }\n}];\n"
+        "jsCode": "// Build Dish Details — sendPhoto (preferred) or sendMessage (fallback)\nconst CURRENCY = '₵';\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\n\nconst parse = $items('Parse Callback')[0]?.json || $json;\nconst sku = parse.sku || $json.sku;\nconst chat_id = parse.chat_id || $json.chat_id;\n\nconst rows = $input.all().map(i => i.json);\nconst row = rows.find(r => String(r.SKU) === String(sku));\n\nif (!row) {\n  return [{\n    json: {\n      _endpoint: 'sendMessage',\n      payload: { chat_id, text: 'Item not found.' }\n    }\n  }];\n}\n\nconst price = Number(row.Price) || 0;\nconst emoji = md(row.Emoji || '').trim();\nconst dishName = md(row.Dish || row.ButtonLabel || row.SKU || '');\nconst namePart = [emoji, dishName].filter(Boolean).join(' ').trim();\nconst notes = row.Notes ? `\n_${{md(row.Notes)}}_` : '';\nconst caption = `*${{namePart}} — ${{CURRENCY}}${{price}}*${{notes}}`;\n\nconst kb = {\n  inline_keyboard: [\n    [{ text: `➕ Add ${row.Dish || row.SKU || ''}`, callback_data: `ADD|${sku}` }],\n    [{ text: '⬅️ Back', callback_data: 'MENU|REFRESH' }]\n  ]\n};\n\nif (row.PhotoURL) {\n  return [{\n    json: {\n      _endpoint: 'sendPhoto',\n      payload: {\n        chat_id,\n        photo: row.PhotoURL,\n        caption,\n        parse_mode: 'Markdown',\n        reply_markup: kb\n      }\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    _endpoint: 'sendMessage',\n    payload: {\n      chat_id,\n      text: caption,\n      parse_mode: 'Markdown',\n      reply_markup: kb\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -1701,7 +1701,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// n8n Code node: Build Cart Summary (old callbacks, new formatting)\n// - Keeps your original callbacks: CART|CHECKOUT, CART|CLEAR, MENU|OPEN\n// - Same cart filtering (this user only, qty>0, not frozen, not PAID)\n// - Shows *line totals* per item (qty * price or saved LineTotal)\n// - Subtotal = sum of line totals; Delivery fee stays 0.00 here\n\n// ---------- helpers ----------\nconst NBSP = '\\u00A0';\nconst WIDTH = 44;                      // adjust 38–50 to tune bubble width\nconst money = v => `₵${Number(v || 0).toFixed(2)}`;\nconst asInt = (v, d = 0) => {\n  const n = Number(v);\n  return Number.isFinite(n) ? n : d;\n};\nconst asNum = (v, d = 0) => {\n  const n = Number(v);\n  return Number.isFinite(n) ? n : d;\n};\n// visible length (strip simple Markdown markers)\nconst visLen = s => String(s).replace(/\\*|_/g, '').length;\nconst padTail = s => s + NBSP.repeat(Math.max(0, WIDTH - visLen(s)));\n\n// ---------- context ----------\nconst ctxItem = $items('Parse Callback')?.[0]?.json ?? {};\nconst chat_id = String(ctxItem.chat_id ?? $json.chat_id ?? '');\nif (!chat_id) {\n  return [{\n    json: { method: 'noop', payload: { reason: 'missing chat_id in Build Cart Summary' } }\n  }];\n}\n\n// ---------- source rows ----------\nconst allRows = $input.all().map(i => i.json);\n\n// Only active, unpaid, unfrozen rows for this user with qty > 0\nconst rows = allRows.filter(r => {\n  if (!r || !r.SKU) return false;\n  if (String(r.chat_id ?? '') !== chat_id) return false;\n  const qty = asInt(r.Quantity, 0);\n  if (qty <= 0) return false;\n  const fr = String(r.Frozen ?? '').trim().toLowerCase();\n  if (fr === 'true' || fr === '1' || fr === 'yes') return false;\n  if (String(r.PaymentStatus ?? '').trim().toUpperCase() === 'PAID') return false;\n  return true;\n});\n\n// ---------- empty state ----------\nif (rows.length === 0) {\n  const text = [\n    '🧺 *Your Cart*',\n    '',\n    '_Your cart is empty._',\n    '',\n    'Tap *View Menu* to add items.'\n  ].join('\\n');\n\n  const keyboard = [\n    [{ text: '📖 View Menu', callback_data: 'MENU|OPEN' }]\n  ];\n\n  return [{\n    json: {\n      method: 'sendMessage',\n      payload: {\n        chat_id,\n        text,\n        parse_mode: 'Markdown',\n        reply_markup: { inline_keyboard: keyboard }\n      }\n    }\n  }];\n}\n\n// ---------- build (now prints line totals) ----------\nlet subtotal = 0;\n\nconst itemLines = rows.map(r => {\n  const dish  = String(r.Dish ?? r.SKU ?? '—');\n  const qty   = asInt(r.Quantity, 0);\n  const unit  = asNum(r.Price, 0);\n\n  // NEW: prefer saved LineTotal, else qty * unit\n  const lineTotal = asNum(r.LineTotal, qty * unit);\n\n  subtotal += lineTotal;\n\n  // • Waakye Set x2 — ₵130.00   (line total)\n  return padTail(`• ${dish} x${qty} — ${money(lineTotal)}`);\n});\n\nconst deliveryFee = 0;                // cart view shows 0.00; checkout computes later\nconst total = subtotal + deliveryFee;\n\n// ---------- keyboard (unchanged: your old callbacks) ----------\nconst keyboard = [\n  [{ text: '🧾 Checkout', callback_data: 'CART|CHECKOUT' }],\n  [\n    { text: '🧹 Clear cart', callback_data: 'CART|CLEAR' },\n    { text: '📖 View Menu',  callback_data: 'MENU|OPEN'  }\n  ]\n];\n\n// ---------- final text ----------\nconst text = [\n  padTail('🧺 *Your Cart*'),\n  '',\n  ...itemLines,\n  '',\n  '',\n  padTail(`*Subtotal:* ${money(subtotal)}`),\n  padTail(`*Delivery fee:* ${money(deliveryFee)}`),\n  padTail(`*Total:* ${money(total)}`)\n].join('\\n');\n\n// ---------- emit ----------\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: { inline_keyboard: keyboard }\n    }\n  }\n}];\n"
+        "jsCode": "// n8n Code node: Build Cart Summary (old callbacks, new formatting)\n// - Keeps your original callbacks: CART|CHECKOUT, CART|CLEAR, MENU|OPEN\n// - Same cart filtering (this user only, qty>0, not frozen, not PAID)\n// - Shows *line totals* per item (qty * price or saved LineTotal)\n// - Subtotal = sum of line totals; Delivery fee stays 0.00 here\n\nconst NBSP = ' ';\nconst WIDTH = 44;\nconst money = v => `₵${{Number(v || 0).toFixed(2)}}`;\nconst asInt = (v, d = 0) => {\n  const n = Number(v);\n  return Number.isFinite(n) ? n : d;\n};\nconst asNum = (v, d = 0) => {\n  const n = Number(v);\n  return Number.isFinite(n) ? n : d;\n};\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst visLen = s => String(s).replace(/\\.|\\*|_/g, '').length;\nconst padTail = s => s + NBSP.repeat(Math.max(0, WIDTH - visLen(s)));\n\nconst ctxItem = $items('Parse Callback')?.[0]?.json ?? {};\nconst chat_id = String(ctxItem.chat_id ?? $json.chat_id ?? '');\nif (!chat_id) {\n  return [{\n    json: { method: 'noop', payload: { reason: 'missing chat_id in Build Cart Summary' } }\n  }];\n}\n\nconst allRows = $input.all().map(i => i.json);\n\nconst rows = allRows.filter(r => {\n  if (!r || !r.SKU) return false;\n  if (String(r.chat_id ?? '') !== chat_id) return false;\n  const qty = asInt(r.Quantity, 0);\n  if (qty <= 0) return false;\n  const fr = String(r.Frozen ?? '').trim().toLowerCase();\n  if (fr === 'true' || fr === '1' || fr === 'yes') return false;\n  if (String(r.PaymentStatus ?? '').trim().toUpperCase() === 'PAID') return false;\n  return true;\n});\n\nif (rows.length === 0) {\n  const text = [\n    '🧺 *Your Cart*',\n    '',\n    '_Your cart is empty._',\n    '',\n    'Tap *View Menu* to add items.'\n  ].join('\n');\n\n  const keyboard = [\n    [{ text: '📖 View Menu', callback_data: 'MENU|OPEN' }]\n  ];\n\n  return [{\n    json: {\n      method: 'sendMessage',\n      payload: {\n        chat_id,\n        text,\n        parse_mode: 'Markdown',\n        reply_markup: { inline_keyboard: keyboard }\n      }\n    }\n  }];\n}\n\nlet subtotal = 0;\n\nconst itemLines = rows.map(r => {\n  const dish  = md(String(r.Dish ?? r.SKU ?? '—'));\n  const qty   = asInt(r.Quantity, 0);\n  const unit  = asNum(r.Price, 0);\n  const lineTotal = asNum(r.LineTotal, qty * unit);\n  subtotal += lineTotal;\n  return padTail(`• ${{dish}} x${{qty}} — ${{money(lineTotal)}}`);\n});\n\nconst deliveryFee = 0;\nconst total = subtotal + deliveryFee;\n\nconst keyboard = [\n  [{ text: '🧾 Checkout', callback_data: 'CART|CHECKOUT' }],\n  [\n    { text: '🧹 Clear cart', callback_data: 'CART|CLEAR' },\n    { text: '📖 View Menu',  callback_data: 'MENU|OPEN'  }\n  ]\n];\n\nconst text = [\n  padTail('🧺 *Your Cart*'),\n  '',\n  ...itemLines,\n  '',\n  '',\n  padTail(`*Subtotal:* ${{money(subtotal)}}`),\n  padTail(`*Delivery fee:* ${{money(deliveryFee)}}`),\n  padTail(`*Total:* ${{money(total)}}`)\n].join('\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: { inline_keyboard: keyboard }\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -2089,7 +2089,7 @@
     },
     {
       "parameters": {
-        "jsCode": "/**\n * Build Checkout Summary (Delivery/Pickup aware)\n * Input: items from \"Attach State → Lines (checkout)\" (cart lines with state fields attached)\n * Output: { method, payload } for Telegram\n */\n\nconst CURRENCY = '₵';\nconst WIDTH = 40;\nconst NBSP = '\\u00A0';\n\nconst money  = n => `${CURRENCY}${(Number(n)||0).toFixed(2)}`;\nconst visLen = s => s.replace(/\\*|_/g,'').length;\nconst pad    = s => s + NBSP.repeat(Math.max(0, WIDTH - visLen(s)));\n\nconst rows = $input.all().map(i => i.json);\n\n// Robust chat_id\nconst chat_id = String(\n  rows[0]?.chat_id ?? rows[0]?.ChatID ?? $json._chat_id ?? $json.chat_id ?? ''\n);\n\nif (!rows.length || !chat_id) {\n  return [{\n    json: {\n      method: 'sendMessage',\n      payload: {\n        chat_id,\n        text: '🧺 Your cart is empty.\\n\\nTap *Menu* to add items.',\n        parse_mode: 'Markdown',\n        reply_markup: { inline_keyboard: [[{ text: '🍽️ Back to Menu', callback_data: 'MENU|REFRESH' }]] }\n      }\n    }\n  }];\n}\n\n// State context (now present on each line)\nconst fulfillmentRaw = String(rows[0]?.Fulfillment || '').toLowerCase().trim();\nconst address  = String(rows[0]?.Address  || '').trim();\nconst zone     = String(rows[0]?.Zone     || '').trim();\nconst phone    = String(rows[0]?.Phone    || '').trim();\nconst feeInput = Number(rows[0]?.DeliveryFee ?? 0);\nconst isPickup   = fulfillmentRaw === 'pickup';\nconst isDelivery = fulfillmentRaw === 'delivery';\nconst fee        = isPickup ? 0 : (Number.isFinite(feeInput) ? feeInput : 0);\n\n// Lines\nconst header = pad('🧺 *Your Cart*');\nconst lines = rows.map(r => {\n  const qty   = Number(r.Quantity ?? r.qty ?? 1) || 1;\n  const price = Number(r.Price ?? r.price ?? 0)  || 0;\n  const name  = String(r.Dish ?? r.name ?? r.SKU ?? '').trim();\n\n  // NEW: prefer saved LineTotal; fall back to qty * price\n  const ltRaw = Number(r.LineTotal ?? r.line_total);\n  const lineTotal = (Number.isFinite(ltRaw) && ltRaw > 0) ? ltRaw : qty * price;\n\n  // CHANGED: print line total, not unit price\n  return pad(`• ${name} x${qty} — ${money(lineTotal)}`);\n});\n\nconst subtotal = rows.reduce((s, r) => {\n  const lt = Number(r.LineTotal ?? r.line_total);\n  if (Number.isFinite(lt) && lt > 0) return s + lt;\n  const q = Number(r.Quantity ?? r.qty ?? 1) || 1;\n  const p = Number(r.Price ?? r.price ?? 0)  || 0;\n  return s + q * p;\n}, 0);\n\nconst fulfillmentLine = isPickup\n  ? '🏪 Pickup at counter'\n  : (isDelivery\n     ? `🚚 Delivery${address ? ` to: ${address}` : ''}${zone ? ` (Zone: ${zone})` : ''}`\n     : '— choose delivery or pickup below —');\n\nconst meta = [\n  pad(`*Fulfillment:* ${fulfillmentLine}`),\n  phone ? pad(`*Phone:* ${phone}`) : null\n].filter(Boolean);\n\nconst foot = [\n  pad(`*Subtotal:* ${money(subtotal)}`),\n  pad(`*Delivery fee:* ${money(fee)}`),\n  pad(`*Total:* ${money(subtotal + fee)}`)\n];\n\nconst text = [header, '', ...lines, '', ...meta, '', ...foot].join('\\n');\n\n// Keyboard\nconst baseRows = [\n  [\n    { text: '🧹 Clear', callback_data: 'CART|CLEAR' },\n    { text: '🍽️ Continue Shopping', callback_data: 'MENU|REFRESH' }\n  ]\n];\n\nlet keyboard;\nif (!isPickup && !isDelivery) {\n  keyboard = [\n    [\n      { text: '🚚 Delivery', callback_data: 'FULFILL|DELIVERY' },\n      { text: '🏪 Pickup',   callback_data: 'FULFILL|PICKUP' }\n    ],\n    ...baseRows\n  ];\n} else if (isPickup) {\n  keyboard = [\n    [{ text: '💳 Pay now', callback_data: 'PAY' }],\n    [{ text: 'Change to Delivery', callback_data: 'FULFILL|DELIVERY' }],\n    ...baseRows\n  ];\n} else {\n  // delivery\n  if (address) {\n    keyboard = [\n      [{ text: '💳 Pay now', callback_data: 'PAY' }],\n      [{ text: 'Change to Pickup', callback_data: 'FULFILL|PICKUP' }],\n      ...baseRows\n    ];\n  } else {\n    keyboard = [\n      [{ text: '📍 Add address', callback_data: 'ADDR|CHANGE' }],\n      [{ text: 'Change to Pickup', callback_data: 'FULFILL|PICKUP' }],\n      ...baseRows\n    ];\n  }\n}\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: { inline_keyboard: keyboard }\n    }\n  }\n}];\n"
+        "jsCode": "/**\n * Build Checkout Summary (Delivery/Pickup aware)\n * Input: items from \"Attach State → Lines (checkout)\" (cart lines with state fields attached)\n * Output: { method, payload } for Telegram\n */\n\nconst CURRENCY = '₵';\nconst WIDTH = 40;\nconst NBSP = ' ';\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\n\nconst money  = n => `${{CURRENCY}}${{(Number(n)||0).toFixed(2)}}`;\nconst visLen = s => String(s).replace(/\\.|\\*|_/g,'').length;\nconst pad    = s => s + NBSP.repeat(Math.max(0, WIDTH - visLen(s)));\n\nconst rows = $input.all().map(i => i.json);\n\nconst chat_id = String(\n  rows[0]?.chat_id ?? rows[0]?.ChatID ?? $json._chat_id ?? $json.chat_id ?? ''\n);\n\nif (!rows.length || !chat_id) {\n  return [{\n    json: {\n      method: 'sendMessage',\n      payload: {\n        chat_id,\n        text: '🧺 Your cart is empty.\n\nTap *Menu* to add items.',\n        parse_mode: 'Markdown',\n        reply_markup: { inline_keyboard: [[{ text: '🍽️ Back to Menu', callback_data: 'MENU|REFRESH' }]] }\n      }\n    }\n  }];\n}\n\nconst fulfillmentRaw = String(rows[0]?.Fulfillment || '').toLowerCase().trim();\nconst address  = String(rows[0]?.Address  || '').trim();\nconst zone     = String(rows[0]?.Zone     || '').trim();\nconst phone    = String(rows[0]?.Phone    || '').trim();\nconst feeInput = Number(rows[0]?.DeliveryFee ?? 0);\nconst isPickup   = fulfillmentRaw === 'pickup';\nconst isDelivery = fulfillmentRaw === 'delivery';\nconst fee        = isPickup ? 0 : (Number.isFinite(feeInput) ? feeInput : 0);\n\nconst safeAddress = address ? md(address) : '';\nconst safeZone = zone ? md(zone) : '';\nconst safePhone = phone ? md(phone) : '';\n\nconst header = pad('🧺 *Your Cart*');\nconst lines = rows.map(r => {\n  const qty   = Number(r.Quantity ?? r.qty ?? 1) || 1;\n  const price = Number(r.Price ?? r.price ?? 0)  || 0;\n  const name  = md(String(r.Dish ?? r.name ?? r.SKU ?? '').trim());\n  const ltRaw = Number(r.LineTotal ?? r.line_total);\n  const lineTotal = (Number.isFinite(ltRaw) && ltRaw > 0) ? ltRaw : qty * price;\n  return pad(`• ${{name}} x${{qty}} — ${{money(lineTotal)}}`);\n});\n\nconst subtotal = rows.reduce((s, r) => {\n  const lt = Number(r.LineTotal ?? r.line_total);\n  if (Number.isFinite(lt) && lt > 0) return s + lt;\n  const q = Number(r.Quantity ?? r.qty ?? 1) || 1;\n  const p = Number(r.Price ?? r.price ?? 0)  || 0;\n  return s + q * p;\n}, 0);\n\nconst fulfillmentLine = isPickup\n  ? '🏪 Pickup at counter'\n  : (isDelivery\n     ? `🚚 Delivery${{safeAddress ? ` to: ${{safeAddress}}` : ''}}${{safeZone ? ` (Zone: ${{safeZone}})` : ''}}`\n     : '— choose delivery or pickup below —');\n\nconst meta = [\n  pad(`*Fulfillment:* ${{fulfillmentLine}}`),\n  safePhone ? pad(`*Phone:* ${{safePhone}}`) : null\n].filter(Boolean);\n\nconst foot = [\n  pad(`*Subtotal:* ${{money(subtotal)}}`),\n  pad(`*Delivery fee:* ${{money(fee)}}`),\n  pad(`*Total:* ${{money(subtotal + fee)}}`)\n];\n\nconst text = [header, '', ...lines, '', ...meta, '', ...foot].join('\n');\n\nconst baseRows = [\n  [\n    { text: '🧹 Clear', callback_data: 'CART|CLEAR' },\n    { text: '🍽️ Continue Shopping', callback_data: 'MENU|REFRESH' }\n  ]\n];\n\nlet keyboard;\nif (!isPickup && !isDelivery) {\n  keyboard = [\n    [\n      { text: '🚚 Delivery', callback_data: 'FULFILL|DELIVERY' },\n      { text: '🏪 Pickup',   callback_data: 'FULFILL|PICKUP' }\n    ],\n    ...baseRows\n  ];\n} else if (isPickup) {\n  keyboard = [\n    [{ text: '💳 Pay now', callback_data: 'PAY' }],\n    [{ text: 'Change to Delivery', callback_data: 'FULFILL|DELIVERY' }],\n    ...baseRows\n  ];\n} else {\n  if (address) {\n    keyboard = [\n      [{ text: '💳 Pay now', callback_data: 'PAY' }],\n      [{ text: 'Change to Pickup', callback_data: 'FULFILL|PICKUP' }],\n      ...baseRows\n    ];\n  } else {\n    keyboard = [\n      [{ text: '📍 Add address', callback_data: 'ADDR|CHANGE' }],\n      [{ text: 'Change to Pickup', callback_data: 'FULFILL|PICKUP' }],\n      ...baseRows\n    ];\n  }\n}\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: { inline_keyboard: keyboard }\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -2290,7 +2290,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Reply: Invalid Phone — do NOT reference other nodes by name\nconst chat_id = $json._chat_id || $json.chat_id;\n\nconst hint =\n  '⚠️ *That phone number looks invalid.*\\n' +\n  'Send something like `0241234567` or `+233241234567`.';\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text: hint,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: 'Cancel', callback_data: 'MENU|OPEN' }]\n        ]\n      }\n    }\n  }\n}];\n"
+        "jsCode": "// Reply: Invalid Phone — do NOT reference other nodes by name\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst chat_id = $json._chat_id || $json.chat_id;\n\nconst hint =\n  '⚠️ *That phone number looks invalid.*\n' +\n  'Send something like `0241234567` or `+233241234567`.';\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text: hint,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: 'Cancel', callback_data: 'MENU|OPEN' }]\n        ]\n      }\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -2619,7 +2619,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Use chat_id from the current item (coming from GS: Save Phone).\nconst chat_id =\n  $json.chat_id ||\n  $json._chat_id ||                 // fallback if you passed it along earlier\n  $items('Normalize Event')[0]?.json?.chat_id;  // last-resort fallback\n\nconst msg =\n  '✅ *Phone saved.*\\n' +\n  'Now please *type your delivery area / address*.\\n\\n' +\n  'Tip: use an area keyword if possible (e.g., `osu`, `airport`, `taifa`, `achimota`, `east legon`).';\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text: msg,\n      parse_mode: 'Markdown'\n    }\n  }\n}];\n"
+        "jsCode": "// Use chat_id from the current item (coming from GS: Save Phone).\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst chat_id =\n  $json.chat_id ||\n  $json._chat_id ||\n  $items('Normalize Event')[0]?.json?.chat_id;\n\nconst msg =\n  '✅ *Phone saved.*\n' +\n  'Now please *type your delivery area / address*.\n\n' +\n  'Tip: use an area keyword if possible (e.g., `osu`, `airport`, `taifa`, `achimota`, `east legon`).';\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text: msg,\n      parse_mode: 'Markdown'\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -2645,7 +2645,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Try current item first (from After Update), then fall back safely.\nconst chat_id =\n  $json.chat_id ??\n  $items('Set Delivery Context')[0].json.chat_id ??\n  $items('Parse Callback')[0].json.chat_id;\n\nconst text =\n  '📦 *Delivery selected.*\\n' +\n  'Please reply with your *phone number* (e.g., `0241234567` or `+233241234567`).';\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: 'Change to Pickup', callback_data: 'FULFILL|PICKUP' }]\n        ]\n      }\n    }\n  }\n}];\n"
+        "jsCode": "// Try current item first (from After Update), then fall back safely.\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst chat_id =\n  $json.chat_id ??\n  $items('Set Delivery Context')[0].json.chat_id ??\n  $items('Parse Callback')[0].json.chat_id;\n\nconst text =\n  '📦 *Delivery selected.*\n' +\n  'Please reply with your *phone number* (e.g., `0241234567` or `+233241234567`).';\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: 'Change to Pickup', callback_data: 'FULFILL|PICKUP' }]\n        ]\n      }\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -3164,7 +3164,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Reply: Address OK  — returns a Telegram sendMessage payload\n\nconst chat_id = $json.chat_id;\n\n// Safe reads with sensible fallbacks\nconst address = String($json.Address ?? '').trim();\nconst zone    = String($json.Zone ?? '').trim();\n\n// Fee: number or string -> pretty, or fallback\nconst rawFee  = $json.DeliveryFee;\nconst feeNum  = (rawFee === '' || rawFee === null || rawFee === undefined)\n  ? null\n  : Number(rawFee);\nconst feeText = (feeNum !== null && !Number.isNaN(feeNum)) ? `₵${feeNum}` : 'to be confirmed';\n\n// Message\nconst text = [\n  '📍 *Address saved*',\n  '',\n  `*Address:* ${address || '—'}`,\n  `*Zone:* ${zone || '—'}`,\n  `*Delivery fee:* ${feeText}`,\n  '',\n  'Use the buttons below, or type a new address to change it.'\n].join('\\n');\n\n// Inline buttons with unique callback_data\nconst reply_markup = {\n  inline_keyboard: [\n    [{ text: '✅ Checkout',        callback_data: 'CHECKOUT|START' }],\n    [{ text: '✏️ Change address',  callback_data: 'ADDR|CHANGE' }],\n    [{ text: '🔁 Change to Pickup',callback_data: 'FULFILL|PICKUP' }],\n  ]\n};\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      disable_web_page_preview: true,\n      reply_markup\n    }\n  }\n}];\n"
+        "jsCode": "// Reply: Address OK  — returns a Telegram sendMessage payload\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst chat_id = $json.chat_id;\n\nconst address = String($json.Address ?? '').trim();\nconst zone    = String($json.Zone ?? '').trim();\n\nconst rawFee  = $json.DeliveryFee;\nconst feeNum  = (rawFee === '' || rawFee === null || rawFee === undefined)\n  ? null\n  : Number(rawFee);\nconst feeText = (feeNum !== null && !Number.isNaN(feeNum)) ? `₵${{feeNum}}` : 'to be confirmed';\n\nconst safeAddress = address ? md(address) : '—';\nconst safeZone = zone ? md(zone) : '—';\n\nconst text = [\n  '📍 *Address saved*',\n  '',\n  `*Address:* ${{safeAddress}}`,\n  `*Zone:* ${{safeZone}}`,\n  `*Delivery fee:* ${{feeText}}`,\n  '',\n  'Use the buttons below, or type a new address to change it.'\n].join('\n');\n\nconst reply_markup = {\n  inline_keyboard: [\n    [{ text: '✅ Checkout',        callback_data: 'CHECKOUT|START' }],\n    [{ text: '✏️ Change address',  callback_data: 'ADDR|CHANGE' }],\n    [{ text: '🔁 Change to Pickup',callback_data: 'FULFILL|PICKUP' }],\n  ]\n};\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      disable_web_page_preview: true,\n      reply_markup\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -3177,7 +3177,7 @@
     },
     {
       "parameters": {
-        "jsCode": "/**\n * Reply: Zone Not Found — Code v2 (single-output)\n * IN: items containing { chat_id, address_text, available[] }\n * OUT: [{ json: { method, payload } }] for Telegram sender\n */\nconst items = $input.all();\n\nconst out = items.map(it => {\n  const j = it?.json || {};\n  const chatId = String(j.chat_id || '').trim();\n  const addr   = (j.address_text ?? '').toString().trim();\n  const zones  = Array.isArray(j.available) ? j.available : [];\n\n  const list = zones.map(z => `• ${z}`).join('\\n');\n  const text = [\n    `❌ I couldn’t match “${addr || 'your area'}” to a delivery zone.`,\n    '',\n    'Reply *with the area name* (just the name), e.g.:',\n    list || '• East Legon\\n• Airport\\n• Osu\\n• Taifa\\n• Achimota',\n  ].join('\\n');\n\n  return {\n    json: {\n      method: 'sendMessage',\n      payload: {\n        chat_id: chatId,\n        text,\n        parse_mode: 'Markdown',\n        disable_web_page_preview: true,\n        // optional: force user to reply with text\n        reply_markup: { force_reply: true }\n      }\n    }\n  };\n});\n\nreturn out;\n"
+        "jsCode": "/**\n * Reply: Zone Not Found — Code v2 (single-output)\n * IN: items containing { chat_id, address_text, available[] }\n * OUT: [{ json: { method, payload } }] for Telegram sender\n */\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst items = $input.all();\n\nconst out = items.map(it => {\n  const j = it?.json || {};\n  const chatId = String(j.chat_id || '').trim();\n  const addr   = (j.address_text ?? '').toString().trim();\n  const zones  = Array.isArray(j.available) ? j.available : [];\n\n  const list = zones.map(z => `• ${{md(z)}}`).join('\n');\n  const displayAddr = addr ? md(addr) : 'your area';\n  const text = [\n    `❌ I couldn’t match “${{displayAddr}}” to a delivery zone.`,\n    '',\n    'Reply *with the area name* (just the name), e.g.:',\n    list || '• East Legon\n• Airport\n• Osu\n• Taifa\n• Achimota',\n  ].join('\n');\n\n  return {\n    json: {\n      method: 'sendMessage',\n      payload: {\n        chat_id: chatId,\n        text,\n        parse_mode: 'Markdown',\n        disable_web_page_preview: true,\n        reply_markup: { force_reply: true }\n      }\n    }\n  };\n});\n\nreturn out;"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -3592,7 +3592,7 @@
     },
     {
       "parameters": {
-        "jsCode": "/**\n * Build a pre-payment checkout summary (Markdown) in user's existing style.\n * Accepts cart rows and one state row in ANY order.\n * Expects columns in cart: Dish, SKU, Price, Quantity, LineTotal\n * Expects state: Fulfillment, Zone, DeliveryFee\n */\n\nconst CURRENCY = '¢'; // keep your Ghana cedi symbol formatting\nconst HEADER = '🧾 *Checkout*';\nconst EMPTY = 'Your cart is empty.\\n\\nTap *Menu* to add items.';\n\n// ---- helpers ----\nconst clean = v => (v ?? '').toString().trim();\nconst num = v => {\n  const n = parseFloat(v);\n  return Number.isFinite(n) ? n : 0;\n};\nconst money = v => `${CURRENCY}${(Math.round(num(v) * 100) / 100).toString()}`;\n\n// ---- collect inputs (cart + state) in any order ----\nlet cart = [];\nlet state = {};\n\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  // Heuristic: state row usually has Fulfillment and Zone fields\n  if ('Fulfillment' in j || 'Zone' in j || 'DeliveryFee' in j) {\n    // choose the first non-empty state row\n    if (!state.chat_id && j.chat_id) state = j;\n  } else {\n    cart.push(j);\n  }\n}\n\n// If the state read returned an array (some n8n versions), normalize:\nif (Array.isArray(state) && state.length) state = state[0];\n\n// Fallback to any upstream chat id\nconst chat_id = $json.chat_id\n  ?? state.chat_id\n  ?? $items(0)[0]?.json?.chat_id\n  ?? $items(1)[0]?.json?.chat_id;\n\n// ---- compute sums ----\nlet lines = [];\nlet subtotal = 0;\n\nfor (const row of cart) {\n  const dish = clean(row.Dish || row.Item || row.Name);\n  const qty  = num(row.Quantity);\n  const price = num(row.Price);\n  const line = num(row.LineTotal) || qty * price;\n\n  if (!dish || qty <= 0) continue;\n\n  subtotal += line;\n  lines.push(`• ${dish}  x${qty}  —  ${money(line)}`);\n}\n\nconst hasItems = lines.length > 0;\n\n// delivery context\nconst fulfillment = clean(state.Fulfillment).toLowerCase(); // 'delivery' | 'pickup'\nconst zone = clean(state.Zone);\nconst deliveryFee = num(state.DeliveryFee);\nconst isDelivery = fulfillment === 'delivery';\n\nconst feeLine =\n  isDelivery\n    ? (deliveryFee > 0\n        ? `\\nDelivery fee (${zone || '—'}): *${money(deliveryFee)}*`\n        : `\\nDelivery fee: *—*`)\n    : '';\n\nconst total = subtotal + (isDelivery ? deliveryFee : 0);\n\n// ---- message text ----\nlet text;\nif (!hasItems) {\n  text = EMPTY;\n} else {\n  text =\n    `${HEADER}\\n\\n` +\n    `${lines.join('\\n')}\\n\\n` +\n    `Subtotal: *${money(subtotal)}*` +\n    `${feeLine}` +\n    `\\nTotal: *${money(total)}*` +\n    `\\n\\nFulfillment: *${fulfillment || '—'}*` +\n    (isDelivery && !zone ? `\\nZone: *—* (tap “✏️ Change address”)` : '');\n}\n\n// ---- inline keyboard (keep your existing callback styles) ----\nconst keyboard = hasItems\n  ? [\n      [\n        { text: '✅ Proceed to pay', callback_data: 'PAY|INSTR' }\n      ],\n      [\n        { text: '✏️ Change address', callback_data: 'ADDR|CHANGE' },\n        { text: '🚗 Change to Pickup', callback_data: 'FULFILL|PICKUP' }\n      ],\n      [\n        { text: '🧹 Clear cart', callback_data: 'CART|CLEAR' },\n        { text: '📜 Menu', callback_data: 'MENU' }\n      ]\n    ]\n  : [\n      [\n        { text: '📜 Menu', callback_data: 'MENU' }\n      ]\n    ];\n\n// ---- emit Telegram payload ----\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: { inline_keyboard: keyboard }\n    }\n  }\n}];\n"
+        "jsCode": "/**\n * Build a pre-payment checkout summary (Markdown) in user's existing style.\n * Accepts cart rows and one state row in ANY order.\n * Expects columns in cart: Dish, SKU, Price, Quantity, LineTotal\n * Expects state: Fulfillment, Zone, DeliveryFee\n */\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst CURRENCY = '¢';\nconst HEADER = '🧾 *Checkout*';\nconst EMPTY = 'Your cart is empty.\n\nTap *Menu* to add items.';\n\nconst clean = v => (v ?? '').toString().trim();\nconst num = v => {\n  const n = parseFloat(v);\n  return Number.isFinite(n) ? n : 0;\n};\nconst money = v => `${{CURRENCY}}${{(Math.round(num(v) * 100) / 100).toString()}}`;\n\nlet cart = [];\nlet state = {};\n\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  if ('Fulfillment' in j || 'Zone' in j || 'DeliveryFee' in j) {\n    if (!state.chat_id && j.chat_id) state = j;\n  } else {\n    cart.push(j);\n  }\n}\n\nif (Array.isArray(state) && state.length) state = state[0];\n\nconst chat_id = $json.chat_id\n  ?? state.chat_id\n  ?? $items(0)[0]?.json?.chat_id\n  ?? $items(1)[0]?.json?.chat_id;\n\nlet lines = [];\nlet subtotal = 0;\n\nfor (const row of cart) {\n  const dishRaw = clean(row.Dish || row.Item || row.Name);\n  const dish = md(dishRaw);\n  const qty  = num(row.Quantity);\n  const price = num(row.Price);\n  const line = num(row.LineTotal) || qty * price;\n\n  if (!dishRaw || qty <= 0) continue;\n\n  subtotal += line;\n  lines.push(`• ${{dish}}  x${{qty}}  —  ${{money(line)}}`);\n}\n\nconst hasItems = lines.length > 0;\n\nconst fulfillmentRaw = clean(state.Fulfillment).toLowerCase();\nconst fulfillment = fulfillmentRaw || '';\nconst zoneRaw = clean(state.Zone);\nconst zone = zoneRaw ? md(zoneRaw) : '—';\nconst deliveryFee = num(state.DeliveryFee);\nconst isDelivery = fulfillment === 'delivery';\n\nconst feeLine =\n  isDelivery\n    ? (deliveryFee > 0\n        ? `\nDelivery fee (${{zone}}): *${{money(deliveryFee)}}*`\n        : `\nDelivery fee: *—*`)\n    : '';\n\nconst total = subtotal + (isDelivery ? deliveryFee : 0);\n\nlet text;\nif (!hasItems) {\n  text = EMPTY;\n} else {\n  const safeFulfillment = md(fulfillment || '—');\n  text =\n    `${{HEADER}}\n\n` +\n    `${{lines.join('\n')}}\n\n` +\n    `Subtotal: *${{money(subtotal)}}*` +\n    `${{feeLine}}` +\n    `\nTotal: *${{money(total)}}*` +\n    `\n\nFulfillment: *${{safeFulfillment}}*` +\n    (isDelivery && !zoneRaw ? `\nZone: *—* (tap “✏️ Change address”)` : '');\n}\n\nconst keyboard = hasItems\n  ? [\n      [\n        { text: '✅ Proceed to pay', callback_data: 'PAY|INSTR' }\n      ],\n      [\n        { text: '✏️ Change address', callback_data: 'ADDR|CHANGE' },\n        { text: '🚗 Change to Pickup', callback_data: 'FULFILL|PICKUP' }\n      ],\n      [\n        { text: '🧹 Clear cart', callback_data: 'CART|CLEAR' },\n        { text: '📜 Menu', callback_data: 'MENU' }\n      ]\n    ]\n  : [\n      [\n        { text: '📜 Menu', callback_data: 'MENU' }\n      ]\n    ];\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: { inline_keyboard: keyboard }\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -3765,7 +3765,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// n8n Code node: Build Payment Instructions (FULL VERSION)\n// - Fixes subtotal=0 (SKU-first split)\n// - Adds \"Back to checkout\" button\n// - Strong visual emphasis on TOTAL\n// -----------------------------------------------------------\n\nconst CONSTANTS = {\n  BrandName:  'Sefake Kitchen',\n  MomoName:   'Sefake Kitchen',\n  MomoNumber: '024XXXXXXX',                // <-- your MoMo number\n  BACK_TO_CHECKOUT_DATA: 'CART|CHECKOUT',  // <-- router action to return to checkout\n};\n\n// ---------- helpers ----------\nconst num = (v, d = 0) => {\n  const s = String(v ?? '').replace(/[, ]/g, '');\n  const n = Number(s);\n  return Number.isFinite(n) ? n : d;\n};\nconst fmt  = (v) => `¢${Number(v).toLocaleString('en-GH', { maximumFractionDigits: 2 })}`;\nconst safe = (s) => (s == null ? '' : String(s).trim());\nconst shortRef = (ref) => (ref ? String(ref).trim() : '');\n\n// ---------- collect all incoming rows ----------\nconst rows = items.map(it => it.json);\n\n// ---------- split into cart vs state/order (SKU-first to avoid misclassifying cart rows) ----------\nlet cart = [];\nlet order = {};\nfor (const j of rows) {\n  const isCartish  = !!(j.SKU || j.Dish || j.Item || j.Name);\n  const isStateish = ('Fulfillment' in j) || ('DeliveryFee' in j) || ('Zone' in j) || ('chat_id' in j);\n\n  if (isCartish) {\n    cart.push(j);\n    if (!order.OrderNumber && j.OrderNumber) order.OrderNumber = safe(j.OrderNumber);\n    if (!order.chat_id    && j.chat_id)     order.chat_id    = j.chat_id;\n  } else if (isStateish) {\n    if (!order.chat_id && j.chat_id) order = { ...j, ...order };\n    else order = { ...order, ...j };\n    if (!order.OrderNumber && j.OrderNumber) order.OrderNumber = safe(j.OrderNumber);\n  } else if (j.OrderNumber && !order.OrderNumber) {\n    order.OrderNumber = safe(j.OrderNumber);\n  }\n}\n\n// ---------- constants (prefer sheet overrides where present) ----------\nconst BrandName   = safe(order.BrandName)   || CONSTANTS.BrandName;\nconst MomoName    = safe(order.MomoName)    || CONSTANTS.MomoName;\nconst MomoNumber  = safe(order.MomoNumber)  || CONSTANTS.MomoNumber;\nconst BACK_CB     = CONSTANTS.BACK_TO_CHECKOUT_DATA;\n\n// ---------- compute money ----------\nlet subtotal = 0;\nfor (const line of cart) {\n  const lt   = num(line.LineTotal);\n  const p    = num(line.Price);\n  const qty  = num(line.Quantity, 1);\n  subtotal  += (Number.isFinite(lt) && lt > 0) ? lt : (p * qty);\n}\nconst deliveryFee = num(order.DeliveryFee, 0);\nconst total       = subtotal + deliveryFee;\n\n// ---------- derive reference & chat ----------\nconst refCode = shortRef(order.OrderNumber || order.OrderUID || order.OrderId || '');\nconst chat_id = order.chat_id || order.ChatID || order.chatid || order.user_id;\n\n// ---------- build message (make TOTAL unmissable) ----------\nconst headline = '💳 *Payment for Order*' + (refCode ? `\\nRef: *${refCode}*` : '');\nconst breakdown = [\n  `Subtotal: *${fmt(subtotal)}*`,\n  ...(deliveryFee > 0 ? [`Delivery fee: *${fmt(deliveryFee)}*`] : []),\n].join('\\n');\n\nconst totalPanel = [\n  '━━━━━━━━━━━━━━━━━━━━',\n  `💥 *TOTAL TO PAY: ${fmt(total)}*`,\n  '━━━━━━━━━━━━━━━━━━━━',\n].join('\\n');\n\nlet lines = [];\nlines.push(headline);\nlines.push('');\nlines.push(breakdown);\nlines.push(totalPanel);\nlines.push('');\nlines.push('🟡 *Very important*');\nif (refCode) {\n  lines.push('When paying, type this in the *Reference/Reason/Message* field:');\n  lines.push(`🧾 *${refCode}*`);\n}\nlines.push('This lets our admin match your payment quickly.');\nlines.push('');\nlines.push('📲 *MoMo Details*');\nlines.push(`• Number: ${MomoNumber}`);\nlines.push(`• Name: ${MomoName}`);\nlines.push('');\nlines.push('After paying, tap *I have paid*. Or tap *Back to checkout* to review your order.');\nconst text = lines.join('\\n');\n\n// ---------- inline keyboard ----------\nconst confirmCb = `PAY|CONFIRM|${refCode || 'UNKNOWN'}`;\nconst reply_markup = {\n  inline_keyboard: [\n    [{ text: '✅ I have paid',      callback_data: confirmCb }],\n    [{ text: '⬅️ Back to checkout', callback_data: BACK_CB }],\n  ],\n};\n\n// ---------- return Telegram payload ----------\nreturn [\n  {\n    json: {\n      method: 'sendMessage',\n      payload: {\n        chat_id,\n        text,\n        parse_mode: 'Markdown',\n        reply_markup,\n      },\n    },\n  },\n];\n"
+        "jsCode": "// n8n Code node: Build Payment Instructions (FULL VERSION)\n// - Fixes subtotal=0 (SKU-first split)\n// - Adds \"Back to checkout\" button\n// - Strong visual emphasis on TOTAL\n// -----------------------------------------------------------\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\n\nconst CONSTANTS = {\n  BrandName:  'Sefake Kitchen',\n  MomoName:   'Sefake Kitchen',\n  MomoNumber: '024XXXXXXX',\n  BACK_TO_CHECKOUT_DATA: 'CART|CHECKOUT',\n};\n\nconst num = (v, d = 0) => {\n  const s = String(v ?? '').replace(/[, ]/g, '');\n  const n = Number(s);\n  return Number.isFinite(n) ? n : d;\n};\nconst fmt  = (v) => `¢${{Number(v).toLocaleString('en-GH', { maximumFractionDigits: 2 })}}`;\nconst safe = (s) => (s == null ? '' : String(s).trim());\nconst shortRef = (ref) => (ref ? String(ref).trim() : '');\n\nconst rows = items.map(it => it.json);\n\nlet cart = [];\nlet order = {};\nfor (const j of rows) {\n  const isCartish  = !!(j.SKU || j.Dish || j.Item || j.Name);\n  const isStateish = ('Fulfillment' in j) || ('DeliveryFee' in j) || ('Zone' in j) || ('chat_id' in j);\n\n  if (isCartish) {\n    cart.push(j);\n    if (!order.OrderNumber && j.OrderNumber) order.OrderNumber = safe(j.OrderNumber);\n    if (!order.chat_id    && j.chat_id)     order.chat_id    = j.chat_id;\n  } else if (isStateish) {\n    if (!order.chat_id && j.chat_id) order = { ...j, ...order };\n    else order = { ...order, ...j };\n    if (!order.OrderNumber && j.OrderNumber) order.OrderNumber = safe(j.OrderNumber);\n  } else if (j.OrderNumber && !order.OrderNumber) {\n    order.OrderNumber = safe(j.OrderNumber);\n  }\n}\n\nconst BrandName   = safe(order.BrandName)   || CONSTANTS.BrandName;\nconst MomoName    = safe(order.MomoName)    || CONSTANTS.MomoName;\nconst MomoNumber  = safe(order.MomoNumber)  || CONSTANTS.MomoNumber;\nconst BACK_CB     = CONSTANTS.BACK_TO_CHECKOUT_DATA;\n\nlet subtotal = 0;\nfor (const line of cart) {\n  const lt   = num(line.LineTotal);\n  const p    = num(line.Price);\n  const qty  = num(line.Quantity, 1);\n  subtotal  += (Number.isFinite(lt) && lt > 0) ? lt : (p * qty);\n}\nconst deliveryFee = num(order.DeliveryFee, 0);\nconst total       = subtotal + deliveryFee;\n\nconst refCodeRaw = shortRef(order.OrderNumber || order.OrderUID || order.OrderId || '');\nconst refCode = md(refCodeRaw);\nconst chat_id = order.chat_id || order.ChatID || order.chatid || order.user_id;\n\nconst headline = '💳 *Payment for Order*' + (refCodeRaw ? `\nRef: *${{refCode}}*` : '');\nconst breakdown = [\n  `Subtotal: *${{fmt(subtotal)}}*`,\n  ...(deliveryFee > 0 ? [`Delivery fee: *${{fmt(deliveryFee)}}*`] : []),\n].join('\n');\n\nconst totalPanel = [\n  '━━━━━━━━━━━━━━━━━━━━',\n  `💥 *TOTAL TO PAY: ${{fmt(total)}}*`,\n  '━━━━━━━━━━━━━━━━━━━━',\n].join('\n');\n\nlet lines = [];\nlines.push(headline);\nlines.push('');\nlines.push(breakdown);\nlines.push(totalPanel);\nlines.push('');\nlines.push('🟡 *Very important*');\nif (refCodeRaw) {\n  lines.push('When paying, type this in the *Reference/Reason/Message* field:');\n  lines.push(`🧾 *${{refCode}}*`);\n}\nlines.push('This lets our admin match your payment quickly.');\nlines.push('');\nlines.push('📲 *MoMo Details*');\nlines.push(`• Number: ${{md(MomoNumber)}}`);\nlines.push(`• Name: ${{md(MomoName)}}`);\nlines.push('');\nlines.push('After paying, tap *I have paid*. Or tap *Back to checkout* to review your order.');\nconst text = lines.join('\n');\n\nconst confirmCb = `PAY|CONFIRM|${{refCodeRaw || 'UNKNOWN'}}`;\nconst reply_markup = {\n  inline_keyboard: [\n    [{ text: '✅ I have paid',      callback_data: confirmCb }],\n    [{ text: '⬅️ Back to checkout', callback_data: BACK_CB }],\n  ],\n};\n\nreturn [\n  {\n    json: {\n      method: 'sendMessage',\n      payload: {\n        chat_id,\n        text,\n        parse_mode: 'Markdown',\n        reply_markup,\n      },\n    },\n  },\n];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -4209,7 +4209,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Immediately answer the callback to stop the spinner\nreturn [{\n  json: {\n    method: 'answerCallbackQuery',\n    payload: {\n      callback_query_id: $json.cqid,\n      text: 'Thanks! Checking payment…',\n      show_alert: false\n    }\n  }\n}];\n"
+        "jsCode": "// Immediately answer the callback to stop the spinner\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nreturn [{\n  json: {\n    method: 'answerCallbackQuery',\n    payload: {\n      callback_query_id: $json.cqid,\n      text: 'Thanks! Checking payment…',\n      show_alert: false,\n      cache_time: 2,\n    },\n  },\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -4222,7 +4222,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const chat_id = $items('Extract PAY|CONFIRM Ref')[0].json.chat_id;\nconst ref = $items('Extract PAY|CONFIRM Ref')[0].json.ref;\n\nconst text = [\n  '⚠️ *Payment reference not recognised*',\n  ref ? `Ref: *${ref}*` : '',\n  '',\n  'Please double-check and try again.',\n  'If you just paid, wait a few seconds and tap *I have paid* again.'\n].filter(Boolean).join('\\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [[\n          { text: '⬅️ Back to checkout', callback_data: 'CHK|REVIEW' }\n        ]]\n      }\n    }\n  }\n}];\n"
+        "jsCode": "const md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst chat_id = $items('Extract PAY|CONFIRM Ref')[0].json.chat_id;\nconst refRaw = $items('Extract PAY|CONFIRM Ref')[0].json.ref;\nconst ref = refRaw ? md(refRaw) : '';\n\nconst text = [\n  '⚠️ *Payment reference not recognised*',\n  ref ? `Ref: *${{ref}}*` : '',\n  '',\n  'Double-check the code and tap *I have paid* again, or contact support below.'\n].filter(Boolean).join('\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: '🔁 Try again', callback_data: 'PAY|INSTR' }],\n          [{ text: '☎️ Contact support', callback_data: 'HELP|AGENT' }]\n        ]\n      }\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -4235,7 +4235,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Build a simple \"processing payment\" message for the customer\nconst ref = $json.ref || 'UNKNOWN';\nconst chat_id = $json.chat_id;\n\nconst text = [\n  '💳 *Processing your payment...*',\n  `Ref: *${ref}*`,\n  '',\n  '_Please wait a moment while we confirm your payment._'\n].join('\\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: '⬅️ Back to checkout', callback_data: 'CART|CHECKOUT' }],\n          [{ text: '☎️ Contact support', callback_data: 'HELP|AGENT' }]\n        ]\n      }\n    }\n  }\n}];\n"
+        "jsCode": "// Build a simple \"processing payment\" message for the customer\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst ref = md($json.ref || 'UNKNOWN');\nconst chat_id = $json.chat_id;\n\nconst text = [\n  '💳 *Processing your payment...*',\n  `Ref: *${{ref}}*`,\n  '',\n  '_Please wait a moment while we confirm your payment._'\n].join('\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: '⬅️ Back to checkout', callback_data: 'CART|CHECKOUT' }],\n          [{ text: '☎️ Contact support', callback_data: 'HELP|AGENT' }]\n        ]\n      }\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -4935,7 +4935,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Build Kitchen Message — APPROVE\n// expects from \"Attach Delivery Fee — APPROVE\":\n//   ref, fulfillment, itemLines[], subtotal, deliveryFee, total\n\nconst KITCHEN_CHAT_ID = -1002927487274;   // <-- replace with YOUR kitchen chat/channel id\n\n// pull + normalize\nconst ref          = String($json.ref || '—');\nconst fulfill      = String($json.fulfillment || 'delivery');\nconst items        = Array.isArray($json.itemLines) ? $json.itemLines : [];\nconst subtotal     = Number($json.subtotal || 0);\nconst deliveryFee  = Number($json.deliveryFee || 0);\nconst total        = Number($json.total || (subtotal + deliveryFee));\n\n// guard: if no kitchen id, bail quietly\nif (!KITCHEN_CHAT_ID) return [];\n\n// money helper (cedi)\nconst money = n => `₵${Number(n || 0).toFixed(2)}`;\n\nconst lineSep = '__________________________________';\nconst bullet  = items.length\n  ? items.map((l, i) => `${i + 1}. ${l}`).join('\\n')    // 1-based numbering\n  : '—';\n\nconst text = [\n  '✅ *PAID ORDER*',\n  `Ref: *${ref}*`,\n  `Fulfillment: *${fulfill}*`,\n  '',\n  'Items:',\n  bullet,\n  '',\n  `Subtotal: ${money(subtotal)}`,\n  `Delivery fee: ${money(deliveryFee)}`,\n  lineSep,\n  `TOTAL: *${money(total)}*`,\n  lineSep\n].join('\\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id: KITCHEN_CHAT_ID,\n      text,\n      parse_mode: 'Markdown'\n    }\n  }\n}];\n"
+        "jsCode": "// Build Kitchen Message — APPROVE\n// expects from \"Attach Delivery Fee — APPROVE\":\n//   ref, fulfillment, itemLines[], subtotal, deliveryFee, total\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst KITCHEN_CHAT_ID = -1002927487274;\n\nconst ref          = md(String($json.ref || '—'));\nconst fulfill      = md(String($json.fulfillment || 'delivery'));\nconst items        = Array.isArray($json.itemLines) ? $json.itemLines.map(l => md(String(l))) : [];\nconst subtotal     = Number($json.subtotal || 0);\nconst deliveryFee  = Number($json.deliveryFee || 0);\nconst total        = Number($json.total || (subtotal + deliveryFee));\n\nif (!KITCHEN_CHAT_ID) return [];\n\nconst money = n => `₵${{Number(n || 0).toFixed(2)}}`;\n\nconst lineSep = '__________________________________';\nconst bullet  = items.length\n  ? items.map((l, i) => `${{i + 1}}. ${{l}}`).join('\n')\n  : '—';\n\nconst text = [\n  '✅ *PAID ORDER*',\n  `Ref: *${{ref}}*`,\n  `Fulfillment: *${{fulfill}}*`,\n  '',\n  'Items:',\n  bullet,\n  '',\n  `Subtotal: ${{money(subtotal)}}`,\n  `Delivery fee: ${{money(deliveryFee)}}`,\n  lineSep,\n  `TOTAL: *${{money(total)}}*`,\n  lineSep\n].join('\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id: KITCHEN_CHAT_ID,\n      text,\n      parse_mode: 'Markdown'\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -4948,7 +4948,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Customer Ack (APPROVE path)\n// expects: chat_id, ref, total, fulfillment (from Attach Delivery Fee — APPROVE)\n\nconst chatId  = String($json.chat_id || '');\nconst ref     = String($json.ref || '—');\nconst fulfill = String($json.fulfillment || 'your order');\nconst total   = Number($json.total || 0);\n\n// (Optional) guard: if chatId is missing, do nothing to avoid HTTP error\nif (!chatId) return [];\n\nconst text = [\n  '✅ *Payment received!*',\n  `Ref: *${ref}*`,\n  '',\n  `Total paid: *₵${total.toFixed(2)}*`,\n  '',\n  `Thanks! We’re preparing for ${fulfill}.`, \n  '_Our driver will call you when it’s ready for delivery/pickup._'\n].join('\\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id: chatId,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n                    [{ text: '🍽️ Continue shopping', callback_data: 'MENU|REFRESH' }],\n                    [{ text: '☎️ Contact support', callback_data: 'HELP|AGENT' }]\n        ]\n      }\n    }\n  }\n}];\n"
+        "jsCode": "// Customer Ack (APPROVE path)\n// expects: chat_id, ref, total, fulfillment\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\n\nconst chatId  = String($json.chat_id || '');\nconst ref     = md(String($json.ref || '—'));\nconst fulfill = md(String($json.fulfillment || 'your order'));\nconst total   = Number($json.total || 0);\n\nif (!chatId) return [];\n\nconst text = [\n  '✅ *Payment received!*',\n  `Ref: *${{ref}}*`,\n  '',\n  `Total paid: *₵${{total.toFixed(2)}}*`,\n  '',\n  `Thanks! We’re preparing for ${{fulfill}}.`,\n  '_Our driver will call you when it’s ready for delivery/pickup._'\n].join('\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id: chatId,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: '🍽️ Continue shopping', callback_data: 'MENU|REFRESH' }],\n          [{ text: '☎️ Contact support', callback_data: 'HELP|AGENT' }]\n        ]\n      }\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -4961,7 +4961,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const ADMIN_CHAT_ID = -1002927487274; // <-- your staff chat id\nconst { ref, chat_id, itemLines = [], subtotal = 0, deliveryFee = 0, total = 0, fulfillment = '' } = $json;\n\n// keep callback small: only ref + chat_id\nconst packed = JSON.stringify({ ref, chat_id });\n\nconst txt = [\n  '🧾 *Payment review*',\n  `Ref: *${ref}*`,\n  fulfillment ? `Fulfillment: *${fulfillment}*` : '',\n  '',\n  'Items:',\n  ...itemLines,\n  '',\n  `Subtotal: *₵${(+subtotal).toFixed(2)}*`,\n  deliveryFee > 0 ? `Delivery fee: *₵${(+deliveryFee).toFixed(2)}*` : '',\n  '━━━━━━━━━━━━━━━━━━━━',\n  `TOTAL: *₵${(+total).toFixed(2)}*`,\n  '━━━━━━━━━━━━━━━━━━━━',\n].filter(Boolean).join('\\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id: ADMIN_CHAT_ID,\n      text: txt,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [[\n          { text: '✅ Approve', callback_data: `ADMIN|APPROVE|${packed}` },\n          { text: '❌ Reject',  callback_data: `ADMIN|REJECT|${packed}` }\n        ]]\n      }\n    }\n  }\n}];\n"
+        "jsCode": "const md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst ADMIN_CHAT_ID = -1002927487274;\nconst { ref, chat_id, itemLines = [], subtotal = 0, deliveryFee = 0, total = 0, fulfillment = '' } = $json;\n\nconst packed = JSON.stringify({ ref, chat_id });\n\nconst safeRef = md(String(ref || '—'));\nconst safeFulfill = fulfillment ? md(String(fulfillment)) : '';\nconst safeLines = itemLines.map(l => md(String(l)));\n\nconst txt = [\n  '🧾 *Payment review*',\n  `Ref: *${{safeRef}}*`,\n  safeFulfill ? `Fulfillment: *${{safeFulfill}}*` : '',\n  '',\n  'Items:',\n  ...safeLines,\n  '',\n  `Subtotal: *₵${{(+subtotal).toFixed(2)}}*`,\n  deliveryFee > 0 ? `Delivery fee: *₵${{(+deliveryFee).toFixed(2)}}*` : '',\n  '━━━━━━━━━━━━━━━━━━━━',\n  `TOTAL: *₵${{(+total).toFixed(2)}}*`,\n  '━━━━━━━━━━━━━━━━━━━━',\n].filter(Boolean).join('\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id: ADMIN_CHAT_ID,\n      text: txt,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [[\n          { text: '✅ Approve', callback_data: `ADMIN|APPROVE|${{packed}}` },\n          { text: '❌ Reject',  callback_data: `ADMIN|REJECT|${{packed}}` }\n        ]]\n      }\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -5052,7 +5052,7 @@
     },
     {
       "parameters": {
-        "jsCode": "return [{\n  json: {\n    method: 'answerCallbackQuery',\n    payload: { callback_query_id: $json.cqid, text: 'Noted.', show_alert: false }\n  }\n}];\n"
+        "jsCode": "const md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nreturn [{\n  json: {\n    method: 'answerCallbackQuery',\n    payload: { callback_query_id: $json.cqid, text: 'Noted.', show_alert: false }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -5241,7 +5241,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const ex = $items('Extract Admin Action(Reject)')[0]?.json || {};\nconst chat_id = String($json.chat_id || ex.chat_id || '');\nif (!chat_id) return [];\n\nconst ref     = String($json.OrderNumber || $json.ref || ex.ref || '—');\nconst fulfill = String($json.Fulfillment || $json.fulfillment || 'your order');\nconst reason  = String(ex.reject_reason || $json.reject_reason || '').trim();\n\nconst text = [\n  '❌ *Order not accepted*',\n  `Ref: *${ref}*`,\n  '',\n  `We’re unable to proceed with ${fulfill} at this time.`,\n  reason ? `Reason: _${reason}_` : '',\n  '',\n  'You can try again or contact us below:'\n].filter(Boolean).join('\\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id, text, parse_mode: 'Markdown',\n      reply_markup: { inline_keyboard: [\n        [{ text: '🧾 View menu',  callback_data: 'MENU|OPEN' }],\n        [{ text: '🔁 Start over', callback_data: 'RESET|START' }],\n        [{ text: '☎️ Contact support', callback_data: 'HELP|AGENT' }]\n      ] }\n    }\n  }\n}];\n"
+        "jsCode": "const md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst ex = $items('Extract Admin Action(Reject)')[0]?.json || {};\nconst chat_id = String($json.chat_id || ex.chat_id || '');\nif (!chat_id) return [];\n\nconst refRaw     = String($json.OrderNumber || $json.ref || ex.ref || '—');\nconst ref        = md(refRaw);\nconst fulfillRaw = String($json.Fulfillment || $json.fulfillment || 'your order');\nconst fulfill    = md(fulfillRaw);\nconst reasonRaw  = String(ex.reject_reason || $json.reject_reason || '').trim();\nconst reason     = reasonRaw ? md(reasonRaw) : '';\n\nconst text = [\n  '❌ *Order not accepted*',\n  `Ref: *${{ref}}*`,\n  '',\n  `We’re unable to proceed with ${{fulfill}} at this time.`,\n  reason ? `Reason: _${{reason}}_` : '',\n  '',\n  'You can try again or contact us below:'\n].filter(Boolean).join('\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id, text, parse_mode: 'Markdown',\n      reply_markup: { inline_keyboard: [\n        [{ text: '🧾 View menu',  callback_data: 'MENU|OPEN' }],\n        [{ text: '🔁 Start over', callback_data: 'RESET|START' }],\n        [{ text: '☎️ Contact support', callback_data: 'HELP|AGENT' }]\n      ] }\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -5850,7 +5850,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Reply: Contact Support\nconst chat_id = $json.chat_id;\n\nconst text = [\n  '☎️ *Contact support*',\n  'Our driver or team will call you when your order is ready.',\n  '',\n  'If it’s urgent, call: *0243 957 386*',\n  ].join('\\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown'\n    }\n  }\n}];\n"
+        "jsCode": "// Reply: Contact Support\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst chat_id = $json.chat_id;\n\nconst text = [\n  '☎️ *Contact support*',\n  'Our driver or team will call you when your order is ready.',\n  '',\n  'If it’s urgent, call: *0243 957 386*',\n  ].join('\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown'\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -6086,7 +6086,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Reply: Pickup → Ask Phone\nconst chat_id = $json.chat_id;\n\nconst text = [\n  '🏪 *Pickup selected.*',\n  'Please reply with your *phone number* (e.g., `0241234567` or `+233241234567`).'\n].join('\\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: 'Change to Delivery', callback_data: 'FULFILL|DELIVERY' }]\n        ]\n      }\n    }\n  }\n}];\n"
+        "jsCode": "// Reply: Pickup → Ask Phone\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst chat_id = $json.chat_id;\n\nconst text = [\n  '🏪 *Pickup selected.*',\n  'Please reply with your *phone number* (e.g., `0241234567` or `+233241234567`).'\n].join('\n');\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: 'Change to Delivery', callback_data: 'FULFILL|DELIVERY' }]\n        ]\n      }\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -6530,7 +6530,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const brand = $env.BRAND_NAME || 'Sefake Kitchen';\nconst momo  = $env.MOMO_NUMBER || '';\n\nconst lines = [\n  `👋 Welcome to *${brand}*!`,\n  `Order delicious meals via Telegram.`,\n  ``,\n  `• Tap *Menu* to start an order`,\n  `• Already have a cart? Tap *Checkout*`,\n  ...(momo ? [`• MoMo: ${momo}`] : []),\n];\n\nconst text = lines.join('\\n');\nconst out = [];\n\nfor (const it of $input.all()) {\n  const j = it.json || {};\n  const chat_id = j.chat_id;\n\n  const reply_markup = {\n    inline_keyboard: [\n      [{ text: '📖 Menu',     callback_data: 'MENU|OPEN' }],\n      [{ text: '🧾 Checkout', callback_data: 'CART|CHECKOUT' }]\n    ]\n  };\n\n  out.push({\n    json: {\n      method: 'sendMessage',\n      payload: {\n        chat_id,\n        text,\n        parse_mode: 'Markdown',\n        disable_web_page_preview: true,\n        reply_markup\n      }\n    }\n  });\n}\n\nreturn out;\n"
+        "jsCode": "const md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst brand = md($env.BRAND_NAME || 'Sefake Kitchen');\nconst momoRaw  = $env.MOMO_NUMBER || '';\nconst momo  = momoRaw ? md(momoRaw) : '';\n\nconst lines = [\n  `👋 Welcome to *${{brand}}*!`,\n  `Order delicious meals via Telegram.`,\n  ``,\n  `• Tap *Menu* to start an order`,\n  `• Already have a cart? Tap *Checkout*`,\n  ...(momo ? [`• MoMo: ${{momo}}`] : []),\n];\n\nconst text = lines.join('\n');\nconst out = [];\n\nfor (const it of $input.all()) {\n  const j = it.json || {};\n  const chat_id = j.chat_id;\n\n  const reply_markup = {\n    inline_keyboard: [\n      [{ text: '📖 Menu',     callback_data: 'MENU|OPEN' }],\n      [{ text: '🧾 Checkout', callback_data: 'CART|CHECKOUT' }]\n    ]\n  };\n\n  out.push({\n    json: {\n      method: 'sendMessage',\n      payload: {\n        chat_id,\n        text,\n        parse_mode: 'Markdown',\n        disable_web_page_preview: true,\n        reply_markup\n      }\n    }\n  });\n}\n\nreturn out;"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -6556,7 +6556,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Closed message (shows hours + days)\nconst brand = $env.BRAND_NAME || 'Sefake Kitchen';\nconst OPEN  = $env.OPEN_HHMM  || '09:00';\nconst CLOSE = $env.CLOSE_HHMM || '20:00';\nconst DAYS  = ($env.OPEN_DAYS || 'Mon,Tue,Wed,Thu,Fri,Sat').split(',').map(s => s.trim()).join(', ');\n\n// Message body\nconst lines = [\n  `⏳ *${brand}* is currently *closed*.`,\n  `🕒 *Hours:* ${OPEN}–${CLOSE}`,\n  `📅 *Days:* ${DAYS}`,\n  '',\n  `You can still browse the menu. If you’ve already paid, tap *I have paid* in your earlier message.`,\n];\n\nconst text = lines.join('\\n');\n\n// Buttons: safe actions while closed\nconst reply_markup = {\n  inline_keyboard: [\n    [{ text: '📖 View menu',     callback_data: 'MENU|OPEN' }],\n    [{ text: '🧾 Go to checkout', callback_data: 'CART|CHECKOUT' }],\n  ]\n};\n\n// Emit Telegram payload expected by your HTTP node\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id: $json.chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup,\n    }\n  }\n}];\n"
+        "jsCode": "// Closed message (shows hours + days)\nconst md = s => String(s ?? '').replace(/([_*\\[\\]()~`>#+\\-=|{}.!])/g, '\\\\$1');\nconst brand = md($env.BRAND_NAME || 'Sefake Kitchen');\nconst OPEN  = md($env.OPEN_HHMM  || '09:00');\nconst CLOSE = md($env.CLOSE_HHMM || '20:00');\nconst DAYS  = md(($env.OPEN_DAYS || 'Mon,Tue,Wed,Thu,Fri,Sat').split(',').map(s => s.trim()).join(', '));\n\nconst lines = [\n  `⏳ *${{brand}}* is currently *closed*.`,\n  `🕒 *Hours:* ${{OPEN}}–${{CLOSE}}`,\n  `📅 *Days:* ${{DAYS}}`,\n  '',\n  `You can still browse the menu. If you’ve already paid, tap *I have paid* in your earlier message.`,\n];\n\nconst text = lines.join('\n');\n\nconst reply_markup = {\n  inline_keyboard: [\n    [{ text: '📖 View menu',     callback_data: 'MENU|OPEN' }],\n    [{ text: '🧾 Go to checkout', callback_data: 'CART|CHECKOUT' }],\n  ]\n};\n\nreturn [{\n  json: {\n    method: 'sendMessage',\n    payload: {\n      chat_id: $json.chat_id,\n      text,\n      parse_mode: 'Markdown',\n      reply_markup,\n    }\n  }\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -6566,42 +6566,6 @@
       ],
       "id": "f742283e-e13e-41c9-b0c3-4443f745beda",
       "name": "Build Closed Message"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "=https://api.telegram.org/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{$json.payload}}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -3040,
-        1440
-      ],
-      "id": "47468b75-da8f-49a0-8f17-7e6df380ab87",
-      "name": "HTTP Send → Customer (sendMessage)"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "=https://api.telegram.org/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{$json.payload}}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -3568,
-        1904
-      ],
-      "id": "930b53e2-f73c-4e65-bb34-3ffe1be02fdf",
-      "name": "HTTP Send → Customer (sendMessage)1"
     },
     {
       "parameters": {
@@ -6653,101 +6617,13 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify($json.payload ?? $json) }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -1120,
-        4848
-      ],
-      "id": "472c8670-7a5b-458a-ac04-c793bfbdbdc1",
-      "name": "HTTP: Send (customer)"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify($json.payload ?? $json) }}\n",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -48,
-        4624
-      ],
-      "id": "73a30c53-2f5a-4c96-9b34-8d793546e2d3",
-      "name": "HTTP: Send (customer Pickup)"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        1168,
-        4096
-      ],
-      "id": "a5434c9e-bf96-4b17-a91a-4e67a4ce6eb3",
-      "name": "HTTP: Send Payment Instructions"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -320,
-        3536
-      ],
-      "id": "67c54966-edfe-4b2a-859e-f11ef6b2e156",
-      "name": "HTTP: Send Checkout Summary"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        1168,
-        2608
-      ],
-      "id": "d8164d64-052e-4cc3-86d2-4ad98149d0bd",
-      "name": "HTTP: Send Ask Phone"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "=https://api.telegram.org/bot{{$env.TG_BOT_TOKEN}}/{{ $json.__endpoint || $json.method || 'sendMessage' }}",
+        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json._endpoint || $json.method || 'sendMessage' }}",
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify($json.payload) }}",
-        "options": {}
+        "options": {
+          "maxRetries": 0
+        }
       },
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -6761,209 +6637,13 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
+        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json._endpoint || $json.method || 'sendMessage' }}",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\n  \"chat_id\": {{$items('Parse Callback')[0].json.chat_id}},\n  \"parse_mode\": \"Markdown\",\n  \"text\": \"🧹 Cart cleared\\u00A0\\u00A0\\u00A0\\u00A0\\u00A0\\u00A0\",\n  \"reply_markup\": {\n    \"inline_keyboard\": [\n      [{ \"text\": \"🍽️ Back to Menu\", \"callback_data\": \"MENU|REFRESH\" }],\n      [{ \"text\": \"🧺 View Cart\",     \"callback_data\": \"CART|VIEW\" }]\n    ]\n  }\n}\n",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -64,
-        1920
-      ],
-      "id": "b286b0e4-ab54-4d3c-898a-2a0c875b7a0e",
-      "name": "Send Cleared"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "=https://api.telegram.org/bot{{$env.TG_BOT_TOKEN}}/{{$json.method}}",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{$json.payload}}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -816,
-        1808
-      ],
-      "id": "6fefefcc-85e4-4801-9c45-e1da521d3dce",
-      "name": "Send Cart"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{$env.TG_API_BASE || 'https://api.telegram.org'}}/bot{{$env.TG_BOT_TOKEN}}/sendMessage",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload || $json }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -704,
-        992
-      ],
-      "id": "58734612-6e07-42d7-a706-9aae2ad701c6",
-      "name": "HTTP Request"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -352,
-        704
-      ],
-      "id": "beee51d7-9ca8-43f8-a866-e3f77918707e",
-      "name": "HTTP: Send Zone Not Found"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        192,
-        544
-      ],
-      "id": "2447fb0d-298d-4bab-8819-cfa147fa0ac0",
-      "name": "HTTP: Send Address OK"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -352,
-        320
-      ],
-      "id": "09c4e196-663a-47f5-b44f-3c86b6dc0a65",
-      "name": "HTTP: Send Invalid"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        176,
-        16
-      ],
-      "id": "d888c235-72b7-4659-9cc2-084a343a9bed",
-      "name": "HTTP: Send Ask Address"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "=https://api.telegram.org/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify($json.payload ?? $json) }}\n\n",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        1680,
-        560
-      ],
-      "id": "a948c1fb-b5dd-42af-94a4-6cd379443169",
-      "name": "HTTP Request (sendMessage)"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -4352,
-        2224
-      ],
-      "id": "f08e7978-22ae-41e0-b2e4-f272f70d2765",
-      "name": "HTTP Send → Admin Review"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -4592,
-        2464
-      ],
-      "id": "bb837776-e81b-4ed8-96ff-3b0e523844f6",
-      "name": "HTTP Send → CUSTOMER Ref Not Found"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -5904,
-        2560
-      ],
-      "id": "c9ee5bc3-e9b2-4d6d-af58-885d22ac8763",
-      "name": "HTTP Send → Customer Processing"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
+        "jsonBody": "={{ $json.payload ?? $json }}",
+        "options": {
+          "maxRetries": 0
+        }
       },
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -6973,60 +6653,6 @@
       ],
       "id": "c8830e36-b02f-44dd-abc8-7ee9d3d0fe83",
       "name": "HTTP: Telegram Send"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -4576,
-        3328
-      ],
-      "id": "5c6dbe21-3a94-4e8f-a7b8-0dbee36aca80",
-      "name": "HTTP Send → Customer Paid"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -4560,
-        3536
-      ],
-      "id": "082f1dac-7a03-484e-bcae-df569d42592e",
-      "name": "HTTP Send → Kitchen Paid"
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ ($env.TG_API_BASE || 'https://api.telegram.org') }}/bot{{$env.TG_BOT_TOKEN}}/{{ $json.method || 'sendMessage' }}\n",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ $json.payload }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -5024,
-        4448
-      ],
-      "id": "44cc965c-f2e1-486c-91c8-76e8151f576a",
-      "name": "HTTP Send → Customer Reject"
     },
     {
       "parameters": {},
@@ -7995,7 +7621,7 @@
       "main": [
         [
           {
-            "node": "Send Cleared",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -8101,7 +7727,7 @@
       "main": [
         [
           {
-            "node": "HTTP: Send Invalid",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -8123,7 +7749,7 @@
       "main": [
         [
           {
-            "node": "HTTP: Send Ask Address",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -8145,7 +7771,7 @@
       "main": [
         [
           {
-            "node": "HTTP: Send Ask Phone",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -8285,7 +7911,7 @@
       "main": [
         [
           {
-            "node": "HTTP: Send Zone Not Found",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -8378,7 +8004,7 @@
       "main": [
         [
           {
-            "node": "HTTP: Send Checkout Summary",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -8552,7 +8178,7 @@
       "main": [
         [
           {
-            "node": "HTTP Send → CUSTOMER Ref Not Found",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -8563,7 +8189,7 @@
       "main": [
         [
           {
-            "node": "HTTP Send → Customer Processing",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -8636,7 +8262,7 @@
       "main": [
         [
           {
-            "node": "HTTP Send → Kitchen Paid",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -8658,7 +8284,7 @@
       "main": [
         [
           {
-            "node": "HTTP Send → Customer Paid",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -8724,7 +8350,7 @@
       "main": [
         [
           {
-            "node": "HTTP Send → Admin Review",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -8735,7 +8361,7 @@
       "main": [
         [
           {
-            "node": "HTTP Send → Customer Reject",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -8985,7 +8611,7 @@
       "main": [
         [
           {
-            "node": "HTTP: Send (customer)",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -9035,7 +8661,7 @@
       "main": [
         [
           {
-            "node": "HTTP: Send (customer Pickup)",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -9212,7 +8838,7 @@
       "main": [
         [
           {
-            "node": "HTTP Send → Customer (sendMessage)",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -9223,7 +8849,7 @@
       "main": [
         [
           {
-            "node": "HTTP Send → Customer (sendMessage)1",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -9264,17 +8890,6 @@
         ]
       ]
     },
-    "HTTP: Send Invalid": {
-      "main": [
-        [
-          {
-            "node": "GS: Keep Await Phone",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Merge: State ──→ Needs Phone?": {
       "main": [
         [
@@ -9308,11 +8923,6 @@
         ]
       ]
     },
-    "HTTP Send → Customer Reject": {
-      "main": [
-        []
-      ]
-    },
     "GS: Update Cart Lines1": {
       "main": [
         [
@@ -9339,7 +8949,7 @@
       "main": [
         [
           {
-            "node": "HTTP Request",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -9361,7 +8971,7 @@
       "main": [
         [
           {
-            "node": "Send Cart",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -9372,7 +8982,7 @@
       "main": [
         [
           {
-            "node": "HTTP Request (sendMessage)",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -9383,7 +8993,7 @@
       "main": [
         [
           {
-            "node": "HTTP: Send Address OK",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -9394,7 +9004,7 @@
       "main": [
         [
           {
-            "node": "HTTP: Send Payment Instructions",
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
@@ -9549,6 +9159,17 @@
         [
           {
             "node": "GS: Update Cart Lines1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer Callback (immediate)": {
+      "main": [
+        [
+          {
+            "node": "HTTP: Telegram Send",
             "type": "main",
             "index": 0
           }
